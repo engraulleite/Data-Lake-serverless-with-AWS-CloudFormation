@@ -1,0 +1,739 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy do serverless data lake. It will deploy S3 buckets, IAM role and policy, EMR serverless application, Glue catalog resources, and Athena workgroup
+
+## Bucket S3  
+Resources:
+
+  DatalakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'datalake-${AWS::AccountId}-${AWS::Region}'
+
+  ## Athena Workgroup
+  MyAthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: DatalakeWorkgroup
+      Description: WorkGroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        EngineVersion:
+          EffectiveEngineVersion: 'Athena engine version 3'
+          SelectedEngineVersion: 'Athena engine version 3'
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${DatalakeBucket}/query_results/
+
+  SparkApplication:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: datalake-app
+      ReleaseLabel: emr-6.9.0
+      Type: Spark
+      MaximumCapacity:
+        Cpu: 400 vCPU
+        Memory: 3000 GB
+        Disk: 20000 GB
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 900
+      InitialCapacity:
+        - Key: Driver
+          Value:
+            WorkerCount: 1
+            WorkerConfiguration:
+              Cpu: 2 vCPU
+              Memory: 16 GB
+              Disk: 21 GB
+        - Key: Executor
+          Value:
+            WorkerCount: 2
+            WorkerConfiguration:
+              Cpu: 2 vCPU
+              Memory: 8 GB
+              Disk: 20 GB
+
+  ## EMR serverless role 
+  EMRServerlessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - emr-serverless.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Description: "Service role for EMR Serverless"
+      Policies:
+        - PolicyName: EMRServerlessS3AndGlueAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadAccessForEMR
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetEncryptionConfiguration
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - "arn:aws:s3:::*.elasticmapreduce"
+                  - "arn:aws:s3:::*.elasticmapreduce/*"
+                  - !Sub "arn:aws:s3:::${DatalakeBucket}"
+                  - !Sub "arn:aws:s3:::${DatalakeBucket}/*"
+                  - !Sub "arn:aws:s3:::${DatalakeBucket}"
+                  - !Sub "arn:aws:s3:::${DatalakeBucket}/*"
+                  - "arn:aws:s3:::redshift-downloads"
+                  - "arn:aws:s3:::redshift-downloads/*"
+              - Sid: AllowGlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:*Database*
+                  - glue:*Table*
+                  - glue:*Partition*
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/datalake"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/datalake/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/default/*"
+              - Sid: AllowGlueCatalogRead
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/fontedb"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/fontetb/*"
+
+
+  # # Dados de Origem
+  # ################################################################################################
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+        Name: "fontedb"
+
+  GlueTableTimeDim:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: time_dim
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: t_time_sk
+            Type: int
+          - Name: t_time_id
+            Type: string
+          - Name: t_time
+            Type: int
+          - Name: t_hour
+            Type: int
+          - Name: t_minute
+            Type: int
+          - Name: t_second
+            Type: int
+          - Name: t_am_pm
+            Type: string
+          - Name: t_shift
+            Type: string
+          - Name: t_sub_shift
+            Type: string
+          - Name: t_meal_time
+            Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/time_dim/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableDateDim:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: date_dim
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: d_date_sk
+            Type: int
+          - Name: d_date_id
+            Type: string
+          - Name: d_date
+            Type: date
+          - Name: d_month_seq
+            Type: int
+          - Name: d_week_seq
+            Type: int
+          - Name: d_quarter_seq
+            Type: int
+          - Name: d_year
+            Type: int
+          - Name: d_dow
+            Type: int
+          - Name: d_moy
+            Type: int
+          - Name: d_dom
+            Type: int
+          - Name: d_qoy
+            Type: int
+          - Name: d_fy_year
+            Type: int
+          - Name: d_fy_quarter_seq
+            Type: int
+          - Name: d_fy_week_seq
+            Type: int
+          - Name: d_day_name
+            Type: string
+          - Name: d_quarter_name
+            Type: string
+          - Name: d_holiday
+            Type: string
+          - Name: d_weekend
+            Type: string
+          - Name: d_following_holiday
+            Type: string
+          - Name: d_first_dom
+            Type: int
+          - Name: d_last_dom
+            Type: int
+          - Name: d_same_day_ly
+            Type: int
+          - Name: d_same_day_lq
+            Type: int
+          - Name: d_current_day
+            Type: string
+          - Name: d_current_week
+            Type: string
+          - Name: d_current_month
+            Type: string
+          - Name: d_current_quarter
+            Type: string
+          - Name: d_current_year
+            Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/date_dim/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableWebSales:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: web_sales
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: ws_sold_date_sk
+            Type: int
+          - Name: ws_sold_time_sk
+            Type: int
+          - Name: ws_ship_date_sk
+            Type: int
+          - Name: ws_item_sk
+            Type: int	
+          - Name: ws_bill_customer_sk
+            Type: int	
+          - Name: ws_bill_cdemo_sk
+            Type: int
+          - Name: ws_bill_hdemo_sk
+            Type: int	
+          - Name: ws_bill_addr_sk
+            Type: int	
+          - Name: ws_ship_customer_sk
+            Type: int	
+          - Name: ws_ship_cdemo_sk
+            Type: int	
+          - Name: ws_ship_hdemo_sk
+            Type: int	
+          - Name: ws_ship_addr_sk
+            Type: int	
+          - Name: ws_web_page_sk
+            Type: int	
+          - Name: ws_web_site_sk
+            Type: int	
+          - Name: ws_ship_mode_sk
+            Type: int	
+          - Name: ws_warehouse_sk
+            Type: int	
+          - Name: ws_promo_sk
+            Type: int	
+          - Name: ws_order_number
+            Type: int
+          - Name: ws_quantity
+            Type: int
+          - Name: ws_wholesale_cost
+            Type: double
+          - Name: ws_list_price
+            Type: double
+          - Name: ws_sales_price
+            Type: double
+          - Name: ws_ext_discount_amt
+            Type: double
+          - Name: ws_ext_sales_price
+            Type: double
+          - Name: ws_ext_wholesale_cost
+            Type: double
+          - Name: ws_ext_list_price
+            Type: double
+          - Name: ws_ext_tax
+            Type: double
+          - Name: ws_coupon_amt
+            Type: double
+          - Name: ws_ext_ship_cost
+            Type: double
+          - Name: ws_net_paid
+            Type: double
+          - Name: ws_net_paid_inc_tax
+            Type: double
+          - Name: ws_net_paid_inc_ship
+            Type: double
+          - Name: ws_net_paid_inc_ship_tax
+            Type: double
+          - Name: ws_net_profit
+            Type: double
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/web_sales/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+  
+  GlueTableWebReturns:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: web_returns
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: ws_sold_date_sk
+            Type: int
+          - Name: ws_sold_time_sk
+            Type: int
+          - Name: wr_returned_date_sk
+            Type: int   
+          - Name: wr_returned_time_sk 
+            Type: int
+          - Name: wr_item_sk 
+            Type: int 
+          - Name: wr_refunded_customer_sk 
+            Type: int
+          - Name: wr_refunded_cdemo_sk
+            Type: int
+          - Name: wr_refunded_hdemo_sk
+            Type: int
+          - Name: wr_refunded_addr_sk
+            Type: int
+          - Name: wr_returning_customer_sk
+            Type: int
+          - Name: wr_returning_cdemo_sk
+            Type: int   
+          - Name: wr_returning_hdemo_sk
+            Type: int
+          - Name: wr_returning_addr_sk
+            Type: int
+          - Name: wr_web_page_sk
+            Type: int
+          - Name: wr_reason_sk
+            Type: int
+          - Name: wr_order_number 
+            Type: int
+          - Name: wr_return_quantity 
+            Type: int
+          - Name: wr_return_amt 
+            Type: double  
+          - Name: wr_return_tax 
+            Type: double  
+          - Name: wr_return_amt_inc_tax
+            Type: double
+          - Name: wr_fee
+            Type: double
+          - Name: wr_return_ship_cost
+            Type: double
+          - Name: wr_refunded_cash
+            Type: double   
+          - Name: wr_reversed_charge 
+            Type: double 
+          - Name: wr_account_credit
+            Type: double   
+          - Name: wr_net_loss 
+            Type: double          
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/web_returns/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableWebPage:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: web_page
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: wp_web_page_sk
+            Type: int
+          - Name: wp_web_page_id
+            Type: string
+          - Name: wp_rec_start_date
+            Type: string
+          - Name: wp_rec_end_date
+            Type: string	
+          - Name: wp_creation_date_sk
+            Type: int	
+          - Name: wp_access_date_sk
+            Type: int
+          - Name: wp_autogen_flag
+            Type: string	
+          - Name: wp_customer_sk
+            Type: int	
+          - Name: wp_url
+            Type: string	
+          - Name: wp_type
+            Type: string	
+          - Name: wp_char_count
+            Type: int	
+          - Name: wp_link_count
+            Type: int	
+          - Name: wp_image_count
+            Type: int	
+          - Name: wp_max_ad_count
+            Type: int	
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/web_page/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTablePromotion:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: promotion
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: p_promo_sk
+            Type: int
+          - Name: p_promo_id
+            Type: string
+          - Name: p_start_date_sk
+            Type: int
+          - Name: p_end_date_sk
+            Type: int	
+          - Name: p_item_sk
+            Type: int	
+          - Name: p_cost
+            Type: double
+          - Name: p_response_target
+            Type: int	
+          - Name: p_promo_name
+            Type: string	
+          - Name: p_channel_dmail
+            Type: string	
+          - Name: p_channel_email
+            Type: string	
+          - Name: p_channel_catalog
+            Type: string	
+          - Name: p_channel_tv
+            Type: string	
+          - Name: p_channel_radio
+            Type: string	
+          - Name: p_channel_press
+            Type: string
+          - Name: p_channel_event
+            Type: string	
+          - Name: p_channel_demo
+            Type: string	
+          - Name: p_channel_details
+            Type: string	
+          - Name: p_purpose
+            Type: string	
+          - Name: p_discount_active
+            Type: string	
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/promotion/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableItem:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: item
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: i_item_sk
+            Type: int
+          - Name: i_item_id
+            Type: string
+          - Name: i_rec_start_date
+            Type: string
+          - Name: i_rec_end_date
+            Type: string	
+          - Name: i_item_desc
+            Type: string	
+          - Name: i_current_price
+            Type: double
+          - Name: i_wholesale_cost
+            Type: double	
+          - Name: i_brand_id
+            Type: int	
+          - Name: i_brand
+            Type: string	
+          - Name: i_class_id
+            Type: int	
+          - Name: i_class
+            Type: string	
+          - Name: i_category_id
+            Type: int	
+          - Name: i_category
+            Type: string	
+          - Name: i_manufact_id
+            Type: int
+          - Name: i_manufact
+            Type: string	
+          - Name: i_size
+            Type: string	
+          - Name: i_formulation
+            Type: string	
+          - Name: i_color
+            Type: string	
+          - Name: i_units
+            Type: string
+          - Name: i_container
+            Type: string
+          - Name: i_manager_id
+            Type: string
+          - Name: i_product_name
+            Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/item/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableCustomer:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: customer
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: c_customer_sk
+            Type: int
+          - Name: c_customer_id
+            Type: string
+          - Name: c_current_cdemo_sk
+            Type: int
+          - Name: c_current_hdemo_sk
+            Type: int	
+          - Name: c_current_addr_sk
+            Type: int	
+          - Name: c_first_shipto_date_sk
+            Type: int
+          - Name: c_first_sales_date_sk
+            Type: int	
+          - Name: c_salutation
+            Type: string	
+          - Name: c_first_name
+            Type: string	
+          - Name: c_last_name
+            Type: string	
+          - Name: c_preferred_cust_flag
+            Type: string	
+          - Name: c_birth_day
+            Type: int	
+          - Name: c_birth_month
+            Type: int	
+          - Name: c_birth_year
+            Type: int	
+          - Name: c_birth_country
+            Type: string	
+          - Name: c_login
+            Type: string	
+          - Name: c_email_address
+            Type: string	
+          - Name: c_last_review_date
+            Type: string	
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/customer/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+  
+  GlueTableCustomerAddress:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: customer_address
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: ca_address_sk
+            Type: int
+          - Name: ca_address_id
+            Type: string
+          - Name: ca_street_number
+            Type: string
+          - Name: ca_street_name
+            Type: string	
+          - Name: ca_street_type
+            Type: string	
+          - Name: ca_suite_number
+            Type: string
+          - Name: ca_city
+            Type: string	
+          - Name: ca_county
+            Type: string	
+          - Name: ca_state
+            Type: string	
+          - Name: ca_zip
+            Type: string	
+          - Name: ca_country
+            Type: string	
+          - Name: ca_gmt_offset
+            Type: float	
+          - Name: ca_location_type
+            Type: string	
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/customer_address/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+  
+  GlueTableHouseholdDemographics:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: household_demographics
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: hd_demo_sk
+            Type: int
+          - Name: hd_income_band_sk
+            Type: int
+          - Name: hd_buy_potential
+            Type: string
+          - Name: hd_dep_count
+            Type: int
+          - Name: hd_vehicle_count
+            Type: int
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/household_demographics/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+  GlueTableIncomeBand:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: income_band
+        TableType: EXTERNAL_TABLE
+        Parameters: {"classification": "csv"}
+        StorageDescriptor:
+          Columns:
+          - Name: ib_income_band_sk
+            Type: int
+          - Name: ib_lower_bound
+            Type: int
+          - Name: ib_upper_bound
+            Type: int
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: s3://redshift-downloads/TPC-DS/2.13/10GB/income_band/
+          SerdeInfo:
+            Parameters:
+              field.delim: "|"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+Outputs:
+  GlueDatabase:
+    Description: Source database
+    Value: !Ref GlueDatabase
+
+  DatalakeBucketName:
+    Description: The S3 Bucket for the data lake 
+    Value: !Join
+      - ''
+      - - 's3://'
+        - !Ref DatalakeBucket
+
+  EMRApp:
+    Description: EMR serverless application to run serverless spark
+    Value: !Ref SparkApplication
+  
